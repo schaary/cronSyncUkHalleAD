@@ -1,15 +1,62 @@
 #!/usr/bin/env ruby
 # encoding: utf-8
 
+# Dieses Skript synchronisiert die uk-halle.de Adressen aus der AD des
+# Klinikums in das Nutzerprojekt des ITZ.
+# Das Vorgehen besteht aus drei Schritten:
+# 1. Synchronisation der gesamten AD nach Anfangsbuchstaben der Mail-Adresse
+#    in die lokale Redis-Datenbank.
+#    Synchronisation des gesamten UK-Halle.de Bestandes des Nutzerprojektes 
+#    in die lokale Redis-Datenbank.
+# 2. Wenn eine Adresse nicht im Nutzerprojekt bekannt ist, dann wird diese in
+#    die Funktion # uk_halle_pkg.addUser geworfen - diese kümmert sich dann.
+#    (Erläuterungen dazu siehe weiter unten.)
+# 3. NOCH NICHT IMPLEMENTIERT: Wenn eine Adresse im Nutzerprojekt steht, aber
+#    nicht in der AD, dann wird diese Adresse umgehend aus dem Nutzerprojekt
+#    gelöscht.
+#
+# Die Funktion uk_halle_pkg.addUser nimmt die neue Adresse und versucht, zu dem 
+# Vor- und Nachnamen einen Personen-Eintrag in der Personaldatenbank der 
+# Medizinischen Fakultaet zu finden. Wenn das erfolgreich ist, dann wird die
+# Adresse an die gefundene Person gehängt. Wenn das nicht erfolgreich ist, wird
+# anschliessend versucht, ein Eintrag in der Personaldatenbank des Klinikums zu
+# finden. Wenn auch das nicht erfolgreich ist, dann wird die Person als Gast
+# mit dem Geburtsdatum 01.01.1970 angelegt. 
+#
+# In einem späteren, von diesem Skript unabhängigen Schritt, werden alle
+# Gast-Einträge, die eine UK-Halle.de Adresse haben, im Nutzerprojekt gesperrt.
+# Dies erfolgt deshalb, weil wir nur Dienste für die Mitarbeiter der Fakultät
+# und des Klinikums anbieten, nicht für deren Gäste.
+
 require 'thor'
 require 'net/ldap'
 require 'pry'
+require 'awesome_print'
+require 'colored' 
+require 'redis'
+require 'json'
+require 'ruby-plsql'
 
 class SyncUkHalleAD < Thor
-  desc 'fetch','fetch'
-  def fetch
-    connect_uk_ad
-    binding.pry
+
+  UK_HALLE_AD_ADDRESSES = 'uk-halle:s_ad_addresses'.freeze
+  UK_HALLE_USER_BY_ADDRESS = 'uk-halle:h_user_by_addresses'.freeze
+  UK_HALLE_IDM_ADDRESSES = 'uk-halle:s_idm_addresses'.freeze
+
+  desc 'sync','sync new mail addresses into idm'
+  def sync
+    cleanup_redis_db
+    fetch_ad
+    fetch_idm
+
+    missing_entries.each do |mail|
+      user = ad_user_by_mail mail
+      save user['firstname'].to_s, user['lastname'].to_s, mail
+    end
+
+    # obsolete_entries.each do |entry|
+    #   Diesen Eintrag löschen
+    # end
   end
 
 private
@@ -18,9 +65,90 @@ private
       @ad = Net::LDAP.new
       @ad.host = ENV.fetch('AD_UK_HALLE_HOST')
       @ad.port = 389
-      @ad.encryption :simple
       @ad.auth ENV.fetch('AD_UK_HALLE_USER'), ENV.fetch('AD_UK_HALLE_PASSWORD')
+      unless @ad.bind
+        exit!
+      end
     end
+  end
+
+  def connect_redis
+    @redis = Redis.new
+  end
+
+  def connect_idm
+    plsql.connection ||= OCI8.new(
+      ENV.fetch('UMT_USER'),
+      ENV.fetch('UMT_PASSWORD'),
+      ENV.fetch('UMT_SID'))
+  end
+
+  def cleanup_redis_db
+    connect_redis
+    @redis.del UK_HALLE_AD_ADDRESSES
+    @redis.del UK_HALLE_USER_BY_ADDRESS
+    @redis.del UK_HALLE_IDM_ADDRESSES
+  end
+
+  def fetch_idm
+    connect_idm
+    connect_redis
+
+    records = nil
+    plsql.uk_halle_pkg.mailAddressList { |cursor| records = cursor.fetch_all }
+
+    records.each do |record|
+      @redis.sadd UK_HALLE_IDM_ADDRESSES, record[0]
+    end
+  end
+
+  def missing_entries
+    @redis.sdiff UK_HALLE_AD_ADDRESSES, UK_HALLE_IDM_ADDRESSES
+  end
+
+  def obsolete_entries
+    @redis.sdiff UK_HALLE_IDM_ADDRESSES, UK_HALLE_AD_ADDRESSES
+  end
+
+  def ad_user_by_mail address
+    JSON.parse @redis.hget UK_HALLE_USER_BY_ADDRESS, address
+  end
+
+  def fetch_ad
+    connect_uk_ad
+    connect_redis
+
+    ('a'..'z').to_a.each do |letter|
+      filter = Net::LDAP::Filter.construct(
+        "(&(&(&(mail=#{letter}*@uk-halle.de)(objectClass=user))(givenName=*))(sn=*))")
+      attributes = ['mail','givenName', 'sn']
+      @ad.search(
+        base: ENV.fetch('AD_UK_HALLE_BASEDN'),
+        filter: filter,
+        attributes: attributes) do |entry|
+          if entry[:mail][0].to_s.force_encoding('utf-8').downcase.match(/\A[a-z]+\.[a-z]+@uk-halle.de\z/)
+            @redis.sadd(
+              UK_HALLE_AD_ADDRESSES,
+              entry[:mail][0].to_s.force_encoding('utf-8').downcase.strip
+            )
+            @redis.hset(
+              UK_HALLE_USER_BY_ADDRESS,
+              entry[:mail][0].to_s.force_encoding('utf-8').downcase.strip,
+              JSON.generate(
+                firstname: entry[:givenname][0].to_s.force_encoding('utf-8'),
+                lastname: entry[:sn][0].to_s.force_encoding('utf-8')
+              )
+            )
+
+          end
+      end
+    end
+  end
+
+  def save firstname, lastname, mail
+    return 0 if firstname.empty? || lastname.empty?
+
+    plsql.uk_halle_pkg.addUser firstname, lastname, mail
   end
 
 end
