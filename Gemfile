@@ -8,5 +8,5 @@ gem 'colored'
 gem 'redis'
 gem 'json'
 
-gem 'pry'
+#gem 'pry'
 gem 'awesome_print'

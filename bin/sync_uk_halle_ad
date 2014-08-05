@@ -30,7 +30,7 @@
 
 require 'thor'
 require 'net/ldap'
-require 'pry'
+#require 'pry'
 require 'awesome_print'
 require 'colored' 
 require 'redis'
